@@ -1,0 +1,39 @@
+# syntax=docker/dockerfile:1
+#
+# Builds sessionaffinity.so for a PREBUILT bifrost-http Docker image.
+#
+# Go native plugins (plugin.Open) are strict: the .so must be built with the SAME
+#   - Go toolchain version,
+#   - github.com/maximhq/bifrost/core version,
+#   - libc (the official image is Alpine/musl, NOT glibc), and
+#   - OS/arch
+# as the bifrost binary inside your target image, or plugin.Open rejects it with
+# "plugin was built with a different version of package ...".
+#
+# The defaults below match maximhq/bifrost as of core v1.5.15 / Go 1.26.3. OVERRIDE
+# them to match the exact tag you deploy — see the README section
+# "Deploying to a prebuilt Docker image" for how to read them out of your image.
+#
+# Build (BuildKit) and extract the .so to ./out :
+#   docker build -f Dockerfile.plugin \
+#     --build-arg GO_VERSION=1.26.3 \
+#     --build-arg ALPINE_VERSION=3.23 \
+#     --build-arg CORE_VERSION=v1.5.15 \
+#     --target export --output type=local,dest=./out .
+
+ARG GO_VERSION=1.26.3
+ARG ALPINE_VERSION=3.23
+
+FROM golang:${GO_VERSION}-alpine${ALPINE_VERSION} AS build
+ARG CORE_VERSION=v1.5.15
+# CGO is required for buildmode=plugin; musl-dev/gcc provide the toolchain on Alpine.
+RUN apk add --no-cache gcc musl-dev
+WORKDIR /src
+COPY . .
+# Re-pin core to the target image's version, then resolve the dependency graph.
+RUN go get github.com/maximhq/bifrost/core@${CORE_VERSION} && go mod tidy
+RUN CGO_ENABLED=1 go build -buildmode=plugin -o /out/sessionaffinity.so ./plugin
+
+# Export-only stage: copies just the .so so `--output type=local` drops it on the host.
+FROM scratch AS export
+COPY --from=build /out/sessionaffinity.so /

@@ -103,6 +103,91 @@ Two common paths:
 > self-contained and provider-agnostic — it only needs to sit in the HTTP-transport
 > pre-hook chain.
 
+## Deploying to a prebuilt Docker image
+
+A prebuilt image can't have the plugin compiled in, so it's loaded at runtime as a Go
+**native `.so` plugin** via `config.json`:
+
+```json
+{
+  "plugins": [
+    { "enabled": true, "name": "session-affinity",
+      "path": "/app/plugins/sessionaffinity.so",
+      "config": { "include_parent_agent_id": false, "hash_output": false } }
+  ]
+}
+```
+
+`path` may also be an `http(s)://` URL (the loader downloads it). The loader looks up
+package-level functions — provided by the `./plugin` shim (`plugin/main.go`).
+
+### ⚠️ The version-lock constraint (this is the whole game)
+
+`plugin.Open` **rejects** a `.so` unless it was built with the **exact same** Go toolchain,
+`github.com/maximhq/bifrost/core` version, **libc** (the official image is **Alpine/musl**,
+not glibc), and OS/arch as the bifrost binary in your image. Otherwise:
+`plugin was built with a different version of package ...`.
+
+**Do not use the `:latest` tag.** It is a moving target — when it advances and you re-pull,
+your `.so` (pinned to one core version) silently stops loading. **Pin a specific tag**, and
+when you deliberately bump it, **rebuild the `.so` to match**. That re-match is mechanical
+(below), but it is mandatory on every version bump.
+
+### 1. Read the exact versions out of your target image
+
+The runtime image has no Go toolchain, so extract the binary and inspect its build info:
+
+```bash
+id=$(docker create <image>:<tag>)        # e.g. maximhq/bifrost:1.5.x
+docker cp "$id":/app/main ./bifrost-main # binary lives at /app/main
+docker rm "$id"
+go version -m ./bifrost-main | grep -E 'mod\s+github.com/maximhq/bifrost|^.*go1\.'
+# -> the `go1.XX.Y` toolchain  and  `dep github.com/maximhq/bifrost/core vA.B.C`
+```
+
+Feed those into the build args below.
+
+### 2. Build the `.so` against those versions
+
+From this directory, using `Dockerfile.plugin`:
+
+```bash
+docker build -f Dockerfile.plugin \
+  --build-arg GO_VERSION=1.26.3 \
+  --build-arg ALPINE_VERSION=3.23 \
+  --build-arg CORE_VERSION=v1.5.15 \
+  --target export --output type=local,dest=./out .
+# -> ./out/sessionaffinity.so   (Alpine/musl, matching the image)
+```
+
+### 3. Mount it and point config at it
+
+```bash
+docker run ... \
+  -v "$PWD/out/sessionaffinity.so":/app/plugins/sessionaffinity.so:ro \
+  -v "$PWD/config.json":/app/config.json:ro \
+  <image>:<tag>
+```
+
+### 4. Verify it loaded
+
+The loader runs `VerifyBasePlugin` (checks `GetName`/`Cleanup`) at startup. Watch the logs:
+a clean start means it loaded; a `plugin was built with a different version` error means a
+version mismatch — re-check the three build args against step 1.
+
+### Alternative: rebuild the image with the plugin built-in
+
+Because the `.so` must be re-matched on every tag bump, the lower-maintenance option for a
+frequently-updated deployment is to **build a custom image from source** at the tag you want,
+with the plugin added to `builtinPluginNames` and constructed in the loader. You give up
+"prebuilt," but you never fight version skew — each upgrade rebuilds the plugin in lockstep.
+
+|  | `.so` on a pinned prebuilt tag | custom image (built-in) |
+|---|---|---|
+| Uses the official image | ✅ | ❌ (build from source) |
+| Per-upgrade work | rebuild `.so`, re-match 3 versions | rebuild image (plugin always in lockstep) |
+| Skew risk | ⚠️ must re-match each bump | ✅ none |
+
 ## Building & testing
 
 This is a workspace module. From the repo root:

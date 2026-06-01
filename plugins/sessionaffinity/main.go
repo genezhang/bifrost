@@ -29,15 +29,16 @@ import (
 // PluginName is the canonical name of this plugin.
 const PluginName = "session-affinity"
 
-// Config controls how the affinity value is composed.
+// Config controls how the affinity value is composed. JSON tags match the keys
+// accepted under a plugin's "config" object in config.json.
 type Config struct {
 	// IncludeParentAgentID appends x-claude-code-parent-agent-id to the bucket key.
 	// Off by default — the agent id alone is usually enough.
-	IncludeParentAgentID bool
+	IncludeParentAgentID bool `json:"include_parent_agent_id"`
 
 	// HashOutput md5-hashes the composed value to a fixed 32-char hex string. Enable
 	// if the upstream is strict about header length or character set.
-	HashOutput bool
+	HashOutput bool `json:"hash_output"`
 }
 
 // Plugin implements schemas.HTTPTransportPlugin.

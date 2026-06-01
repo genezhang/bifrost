@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.1
+
+- Add `plugin/main.go` `package main` shim and `Dockerfile.plugin` so the plugin can be
+  built as a Go native `.so` and loaded by a prebuilt bifrost image via `config.json`.
+- Add JSON tags to `Config` (`include_parent_agent_id`, `hash_output`) for `config.json`.
+- Document deploying to a prebuilt Docker image, including the Go-plugin version-lock
+  constraint and why `:latest` should be pinned.
+
 ## 0.1.0
 
 - Initial release. HTTP-transport plugin that rewrites the outbound
