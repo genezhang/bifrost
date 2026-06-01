@@ -133,6 +133,21 @@ your `.so` (pinned to one core version) silently stops loading. **Pin a specific
 when you deliberately bump it, **rebuild the `.so` to match**. That re-match is mechanical
 (below), but it is mandatory on every version bump.
 
+### One command (recommended)
+
+`build.sh` does the read-versions-then-build dance in one shot, so a tag bump is a single
+command:
+
+```bash
+./build.sh <image>:<tag>          # e.g. ./build.sh maximhq/bifrost:1.5.15
+# -> ./out/sessionaffinity.so, matched to that image
+```
+
+It reads the Go toolchain + `core` version from the image's binary and the Alpine version
+from `/etc/alpine-release`, then invokes `Dockerfile.plugin`. Override any value via env
+(`GO_VERSION=… CORE_VERSION=… ALPINE_VERSION=… ./build.sh <image>:<tag>`). The manual steps
+below are what it automates.
+
 ### 1. Read the exact versions out of your target image
 
 The runtime image has no Go toolchain, so extract the binary and inspect its build info:
