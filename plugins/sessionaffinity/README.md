@@ -132,6 +132,60 @@ request capture) that:
 - main-agent requests keep `x-session-affinity = <md5(dir)>`
 - subagent requests get `x-session-affinity = <md5(dir)>:<agentId>`
 
+## Maximizing cache hits: the two axes
+
+Cache hit rate is governed by **two independent things**. Affinity is only one of them;
+in practice the other one is the bigger lever.
+
+| Axis | Controlled by | What it does |
+|---|---|---|
+| **Which backend** | `x-session-affinity` (this plugin) | routes you to a server that *might* have a warm cache |
+| **Whether the prefix matches** | prefix stability (below) | makes the cached prefix byte-identical turn-to-turn |
+
+They are multiplicative: affinity gets you to the right machine; prefix stability decides
+whether that machine actually has your prefix cached. Affinity alone plateaus.
+
+### Companion setting: `CLAUDE_CODE_ATTRIBUTION_HEADER=0`
+
+By default Claude Code splices an attribution block (issues URL, package URL, version,
+git SHA) into the **message content** during normalization. That block sits in the
+cacheable region. Disabling it removes that content and stabilizes the prefix:
+
+```bash
+export CLAUDE_CODE_ATTRIBUTION_HEADER=0   # also accepts false / no / off
+```
+
+In a single-agent test this took the hit rate from "improved some" to **90%+**. Set it
+regardless of whether this plugin is in the path — it is a client-side, source-level fix
+for the prefix axis, and it does not interact with affinity routing.
+
+### Does Bifrost's conversion stabilize the prefix? No — verify it doesn't *de*-stabilize.
+
+A natural hope is that routing through Bifrost (Anthropic → unified → provider) might
+normalize the prefix for you and remove the need for `CLAUDE_CODE_ATTRIBUTION_HEADER=0`.
+It does not:
+
+- The attribution lives in **message content**, and the conversion layer is faithful to
+  content — it translates the envelope, not the text. So the attribution survives the
+  round-trip either way. (Conversion only incidentally drops fields it normalizes away,
+  e.g. `metadata.user_id`; content is not one of them.)
+- More importantly, re-serializing through a different schema is itself a **prefix-stability
+  risk**. Automatic prefix caching keys on exact bytes; if the converter's output differs
+  turn-to-turn for identical logical input (tool-argument JSON ordering, content-block
+  flattening, whitespace), the gateway becomes a *new* cache-buster the direct path never
+  had.
+
+Bifrost *does* model `cache_control` breakpoints (`schemas.CacheControl`, ephemeral) and
+can preserve or strip them (`StripCacheControlScope`) — but that honors the client's
+caching intent, it does not clean up a varying prefix.
+
+**Verify, don't assume.** Enable raw-request capture and diff the exact bytes Bifrost
+sends upstream across two turns that share a prefix:
+
+- byte-identical → conversion is cache-safe
+- any diff → you've found a Bifrost-introduced buster; fix the converter rather than chase
+  affinity
+
 ## Caveats
 
 - **Agent id is per type/role, not per invocation.** Two concurrent `Explore` subagents
