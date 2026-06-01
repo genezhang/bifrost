@@ -1,0 +1,144 @@
+# session-affinity plugin
+
+A Bifrost **HTTP-transport plugin** that gives Claude Code **subagents their own
+prompt-cache affinity bucket** when routing to providers that honor an
+`x-session-affinity` header (e.g. **Fireworks**, **Cloudflare AI Gateway**).
+
+---
+
+## The problem
+
+Fireworks/Cloudflare route requests that carry the same `x-session-affinity` value
+to the same backend, keeping the prompt KV-cache warm across turns.
+
+Claude Code can set a static affinity for a whole session via the environment
+variable:
+
+```bash
+export ANTHROPIC_CUSTOM_HEADERS="x-session-affinity:$(echo -n "$PWD" | md5sum | cut -d' ' -f1)"
+```
+
+This works great for a **single agent** — every request shares the project's hash and
+stays on one warm backend.
+
+It breaks down for **subagents**. `ANTHROPIC_CUSTOM_HEADERS` is a *process-level* env
+var, and Claude Code subagents run **in-process** (they are async "sidechains", not
+child processes). So the main agent and every subagent emit the **identical**
+`x-session-affinity`. Because each subagent has a **different prompt prefix** (different
+system prompt + tools), routing them all to the same backend **thrashes** the cache.
+
+You cannot fix this at the source: the env var is static and there is no per-subagent
+hook into it.
+
+## The signal we use instead
+
+Claude Code already tags every **subagent** request with a dedicated header (verified
+in the CLI bundle):
+
+| Header | Present on | Value |
+|---|---|---|
+| `x-claude-code-agent-id` | subagents only | the agent id (e.g. `name@team`), percent-escaped — **not** hashed |
+| `x-claude-code-parent-agent-id` | subagents with a parent | the parent agent id |
+| `x-session-affinity` | all requests | your static `ANTHROPIC_CUSTOM_HEADERS` value |
+
+The main/top-level agent sends **no** `x-claude-code-agent-id`.
+
+> Note: `session_id` is *not* a usable discriminator here — it lives inside the request
+> body (`metadata.user_id`, which is plaintext JSON like
+> `{"device_id":…,"account_uuid":…,"session_id":…}`) and is **shared** by the main agent
+> and all its subagents. The agent-id header is the only per-subagent value on the wire.
+
+## What the plugin does
+
+In `HTTPTransportPreHook` it reads the inbound headers and recomposes the affinity:
+
+```
+main agent  ->  x-session-affinity = <base>             (left untouched)
+subagent    ->  x-session-affinity = <base>:<agentId>   (own bucket, still project-namespaced)
+```
+
+where `<base>` is whatever the client already sent (your `md5(dir)`), and `<agentId>`
+is `x-claude-code-agent-id`. The new value is written through
+`BifrostContextKeyExtraHeaders`, which the provider layer applies to the upstream
+request with `Set()` — so it **overrides** the static client value
+(`core/providers/utils` → `SetExtraHeaders`).
+
+Net effect:
+
+- Same project + same subagent type → same bucket → warm cache across its turns.
+- Different subagent type → different bucket → no cross-contamination.
+- Main agent → unchanged behavior.
+
+## Configuration
+
+```go
+sessionaffinity.Init(sessionaffinity.Config{
+    IncludeParentAgentID: false, // also fold in x-claude-code-parent-agent-id
+    HashOutput:           false, // md5 the composed value to a fixed 32-char hex string
+}, logger)
+```
+
+- **`IncludeParentAgentID`** — append the parent agent id, useful to disambiguate agents
+  that happen to share an agent id.
+- **`HashOutput`** — enable if Fireworks/Cloudflare is strict about header length or
+  character set; produces a clean 32-char hex bucket key.
+
+## Enabling it in bifrost-http
+
+This plugin is **not** registered as a built-in. To load it, add it where the HTTP
+transport assembles its plugins (it is picked up automatically by the transport because
+it satisfies `schemas.HTTPTransportPlugin` — see
+`transports/bifrost-http/lib/config.go` → `GetLoadedHTTPTransportPlugins()` /
+`rebuildDerivedPluginCaches`, which type-asserts `p.(schemas.HTTPTransportPlugin)`).
+
+Two common paths:
+
+1. **Built-in style** — add `sessionaffinity.PluginName` to `builtinPluginNames` in
+   `transports/bifrost-http/lib/config.go` and construct it in the plugin loader where
+   the other built-ins (`governance`, `logging`, …) are instantiated.
+2. **Standalone/SDK** — if you embed Bifrost as a Go library, register the plugin
+   instance directly with the transport's `RegisterPlugin`.
+
+> The exact loader wiring depends on how you run Bifrost; the plugin itself is
+> self-contained and provider-agnostic — it only needs to sit in the HTTP-transport
+> pre-hook chain.
+
+## Building & testing
+
+This is a workspace module. From the repo root:
+
+```bash
+cd plugins/sessionaffinity
+go mod tidy          # resolve indirect deps (needs network or a warm module cache)
+go test ./...        # composeAffinity unit tests (pure, no network)
+```
+
+The affinity-composition logic (`composeAffinity`) is intentionally separated from the
+hook so it is unit-testable without the `core` module — see `affinity_test.go`.
+
+## Verifying without Fireworks
+
+You do **not** need a Fireworks subscription to validate the rewrite — only to observe
+the cache-hit behavior. Point Claude Code at Bifrost with any backend:
+
+```bash
+export ANTHROPIC_BASE_URL="http://localhost:<port>/anthropic"
+export ANTHROPIC_CUSTOM_HEADERS="x-session-affinity:$(echo -n "$PWD" | md5sum | cut -d' ' -f1)"
+```
+
+Run a task that spawns a subagent, then confirm via the plugin's debug log (or raw
+request capture) that:
+
+- main-agent requests keep `x-session-affinity = <md5(dir)>`
+- subagent requests get `x-session-affinity = <md5(dir)>:<agentId>`
+
+## Caveats
+
+- **Agent id is per type/role, not per invocation.** Two concurrent `Explore` subagents
+  share an agent id and therefore a bucket. For prompt-cache affinity that is usually
+  *desirable* (they share a system prompt). If you need per-invocation isolation, the CLI
+  does not currently expose a per-invocation id on the wire — confirm with raw capture
+  before relying on one.
+- **Header passthrough.** The static `x-session-affinity` must already reach the upstream
+  for the single-agent case to work; this plugin overrides it for subagents via the
+  provider extra-headers path.
