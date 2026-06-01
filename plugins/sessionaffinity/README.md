@@ -145,6 +145,26 @@ in practice the other one is the bigger lever.
 They are multiplicative: affinity gets you to the right machine; prefix stability decides
 whether that machine actually has your prefix cached. Affinity alone plateaus.
 
+### Why a static `extra_headers` value isn't enough (and why this plugin exists)
+
+The Bifrost UI (Provider → Networking → Extra Headers) and the `extra_headers` config let
+you set `x-session-affinity` to a **literal string only**. The value is typed as a plain
+string map end to end — `z.record(z.string(), z.string())` in the UI
+(`ui/lib/schemas/providerForm.ts`), `Record<string, string>` in the config types, and a
+static `map[string]string` on the backend — and it is written onto every upstream request
+verbatim. There is **no CEL, template, or expression** support on the value, so it cannot
+read an inbound header such as `x-claude-code-agent-id`.
+
+That makes a static `extra_headers` entry a **single fixed bucket** for every request
+through the provider — main agent and all subagents alike. It helps (you land on one warm
+backend) but plateaus, because different prefixes collide in that one bucket. The only
+header-reading CEL in Bifrost lives in **governance routing**, and it can only choose a
+route (provider/model/key) — it cannot *set* a header. Turning one inbound header into a
+different outbound value requires a request hook, which is exactly what this plugin does.
+
+Use a static `extra_headers` value only for the single-fixed-bucket case; use this plugin
+for per-subagent buckets.
+
 ### Companion setting: `CLAUDE_CODE_ATTRIBUTION_HEADER=0`
 
 By default Claude Code splices an attribution block (issues URL, package URL, version,
